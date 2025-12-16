@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+from typing import Any
+
+import anyio
+import httpx
+import pytest
+from fastapi import FastAPI, Header, Response
+
+from app.config import Settings
+from app.main import create_app
+from tests.ebml_builder import MiniMkvSpec, build_mini_mkv_bytes, build_mkv_with_delayed_tracks
+
+
+def range_response(blob: bytes, range_header: str | None) -> Response:
+    r = range_header
+    if r and r.startswith("bytes="):
+        s, e = r.removeprefix("bytes=").split("-", 1)
+        start = int(s)
+        end = min(int(e), len(blob) - 1)
+        part = blob[start : end + 1]
+        return Response(
+            content=part,
+            media_type="video/x-matroska",
+            status_code=206,
+            headers={"Content-Range": f"bytes {start}-{end}/{len(blob)}", "Accept-Ranges": "bytes"},
+        )
+    return Response(
+        content=blob,
+        media_type="video/x-matroska",
+        status_code=200,
+        headers={"Accept-Ranges": "bytes", "Content-Length": str(len(blob))},
+    )
+
+
+def _upstream_app() -> FastAPI:
+    app = FastAPI()
+    good_bytes = build_mini_mkv_bytes()
+    html_bytes = b"<!doctype html><html>nope</html>"
+
+    @app.get("/stream/{type}/{id}.json")
+    async def upstream_stream(type: str, id: str) -> dict[str, Any]:
+        return {
+            "streams": [
+                {"name": "HTML", "url": "http://upstream/video/html"},
+                {"name": "SLOW", "url": "http://upstream/video/slow"},
+                {"name": "GOOD", "url": "http://upstream/video/good"},
+            ]
+        }
+
+    @app.get("/video/html")
+    async def video_html() -> Response:
+        return Response(
+            content=html_bytes,
+            media_type="text/html",
+            status_code=206,
+            headers={"Accept-Ranges": "bytes"},
+        )
+
+    @app.get("/video/slow")
+    async def video_slow() -> Response:
+        await anyio.sleep(1.0)
+        return Response(
+            content=good_bytes[:2048],
+            media_type="video/x-matroska",
+            status_code=206,
+            headers={"Content-Range": "bytes 0-1024/9999", "Accept-Ranges": "bytes"},
+        )
+
+    @app.get("/video/good")
+    async def video_good(
+        range_header: str | None = Header(default=None, alias="Range"),
+    ) -> Response:
+        return range_response(good_bytes, range_header)
+
+    return app
+
+
+@pytest.mark.asyncio
+async def test_addon_ranks_good_stream_first() -> None:
+    upstream = _upstream_app()
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=upstream), base_url="http://upstream"
+    )
+    settings = Settings(
+        UPSTREAM_BASE_URL="http://upstream",
+        TOP_K_PHASE1="3",
+        TOP_M_PHASE2="1",
+        T_PROBE_TOTAL_MS="200",
+        T_TTFB_MS="100",
+        REQUIRE_SEEKABLE="true",
+    )
+    addon = create_app(settings=settings, client=upstream_client)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=addon), base_url="http://addon"
+    ) as client:
+        r = await client.get("/stream/movie/tt123.json")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["streams"][0]["url"] == "http://upstream/video/good"
+    assert "MKV" in (data["streams"][0].get("title") or "")
+
+    await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_addon_prefers_preferred_audio_lang() -> None:
+    upstream = FastAPI()
+    good_en = build_mini_mkv_bytes(MiniMkvSpec(audio_lang="eng", audio_lang_bcp47="en"))
+    good_nl = build_mini_mkv_bytes(MiniMkvSpec(audio_lang="nld", audio_lang_bcp47="nl"))
+
+    @upstream.get("/stream/{type}/{id}.json")
+    async def upstream_stream(type: str, id: str) -> dict[str, Any]:
+        return {
+            "streams": [
+                {"name": "GOOD_EN", "url": "http://upstream/video/en"},
+                {"name": "GOOD_NL", "url": "http://upstream/video/nl"},
+            ]
+        }
+
+    @upstream.get("/video/en")
+    async def video_en(range_header: str | None = Header(default=None, alias="Range")) -> Response:
+        return range_response(good_en, range_header)
+
+    @upstream.get("/video/nl")
+    async def video_nl(range_header: str | None = Header(default=None, alias="Range")) -> Response:
+        return range_response(good_nl, range_header)
+
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=upstream), base_url="http://upstream"
+    )
+    settings = Settings(
+        UPSTREAM_BASE_URL="http://upstream",
+        TOP_K_PHASE1="2",
+        TOP_M_PHASE2="2",
+        PREFERRED_AUDIO_LANGS="nl,en",
+        T_PROBE_TOTAL_MS="500",
+        T_TTFB_MS="200",
+        REQUIRE_SEEKABLE="true",
+    )
+    addon = create_app(settings=settings, client=upstream_client)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=addon), base_url="http://addon"
+    ) as client:
+        r = await client.get("/stream/movie/tt123.json")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["streams"][0]["url"] == "http://upstream/video/nl"
+
+    await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_phase2_incremental_fetch_extracts_late_tracks_and_labels() -> None:
+    upstream = FastAPI()
+    blob = build_mkv_with_delayed_tracks(
+        tracks_start_at=300 * 1024,
+        spec=MiniMkvSpec(height=720, audio_lang="eng", audio_lang_bcp47="en", audio_channels=6),
+    )
+
+    @upstream.get("/stream/{type}/{id}.json")
+    async def upstream_stream(type: str, id: str) -> dict[str, Any]:
+        return {"streams": [{"name": "LATE", "url": "http://upstream/video/late"}]}
+
+    @upstream.get("/video/late")
+    async def video_late(
+        range_header: str | None = Header(default=None, alias="Range"),
+    ) -> Response:
+        return range_response(blob, range_header)
+
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=upstream), base_url="http://upstream"
+    )
+    settings = Settings(
+        UPSTREAM_BASE_URL="http://upstream",
+        TOP_K_PHASE1="1",
+        TOP_M_PHASE2="1",
+        TOP_P_WEIRD="0",
+        MKV_META_CHUNK_BYTES="262144",
+        MKV_META_MAX_BYTES="2097152",
+        T_PROBE_TOTAL_MS="800",
+        T_TTFB_MS="300",
+        REQUIRE_SEEKABLE="true",
+    )
+    addon = create_app(settings=settings, client=upstream_client)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=addon), base_url="http://addon"
+    ) as c:
+        r = await c.get("/stream/movie/tt123.json")
+    assert r.status_code == 200
+    title = r.json()["streams"][0].get("title") or ""
+    assert "P2✓" in title
+    assert "P3-" in title
+    assert "720p" in title
+    assert "EN" in title
+    assert "HEVC" in title
+    assert "5.1" in title
+
+    await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_labels_show_p2_skipped_and_p3_disabled() -> None:
+    upstream = FastAPI()
+    fast_blob = build_mini_mkv_bytes(MiniMkvSpec(audio_lang="eng", audio_lang_bcp47="en"))
+    slow_blob = build_mini_mkv_bytes(MiniMkvSpec(audio_lang="ita", audio_lang_bcp47="it"))
+
+    @upstream.get("/stream/{type}/{id}.json")
+    async def upstream_stream(type: str, id: str) -> dict[str, Any]:
+        return {
+            "streams": [
+                {"name": "FAST", "url": "http://upstream/video/fast"},
+                {"name": "SLOW", "url": "http://upstream/video/slow2"},
+            ]
+        }
+
+    @upstream.get("/video/fast")
+    async def video_fast(
+        range_header: str | None = Header(default=None, alias="Range"),
+    ) -> Response:
+        return range_response(fast_blob, range_header)
+
+    @upstream.get("/video/slow2")
+    async def video_slow2(
+        range_header: str | None = Header(default=None, alias="Range"),
+    ) -> Response:
+        await anyio.sleep(0.15)
+        return range_response(slow_blob, range_header)
+
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=upstream), base_url="http://upstream"
+    )
+    settings = Settings(
+        UPSTREAM_BASE_URL="http://upstream",
+        TOP_K_PHASE1="2",
+        TOP_M_PHASE2="1",
+        TOP_P_WEIRD="0",
+        T_PROBE_TOTAL_MS="800",
+        T_TTFB_MS="400",
+        REQUIRE_SEEKABLE="true",
+    )
+    addon = create_app(settings=settings, client=upstream_client)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=addon), base_url="http://addon"
+    ) as c:
+        r = await c.get("/stream/movie/tt123.json")
+    assert r.status_code == 200
+    streams = r.json()["streams"]
+    by_url = {s["url"]: s for s in streams}
+    assert "P3-" in (by_url["http://upstream/video/fast"].get("title") or "")
+    assert "P3-" in (by_url["http://upstream/video/slow2"].get("title") or "")
+    assert "P2✓" in (by_url["http://upstream/video/fast"].get("title") or "")
+    assert "P2-" in (by_url["http://upstream/video/slow2"].get("title") or "")
+
+    await upstream_client.aclose()

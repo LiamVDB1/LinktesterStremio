@@ -1,0 +1,26 @@
+services:
+  addon:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      UPSTREAM_BASE_URL: "${UPSTREAM_BASE_URL:-http://example-upstream.invalid}"
+      TOP_K_PHASE1: "${TOP_K_PHASE1:-10}"
+      TOP_M_PHASE2: "${TOP_M_PHASE2:-3}"
+      TOP_P_WEIRD: "${TOP_P_WEIRD:-2}"
+      T_PROBE_TOTAL_MS: "${T_PROBE_TOTAL_MS:-600}"
+      T_TTFB_MS: "${T_TTFB_MS:-250}"
+      UPSTREAM_TIMEOUT_MS: "${UPSTREAM_TIMEOUT_MS:-5000}"
+      MAX_CONCURRENCY: "${MAX_CONCURRENCY:-12}"
+      PREFERRED_AUDIO_LANGS: "${PREFERRED_AUDIO_LANGS:-nl,en,fr}"
+      PREFERRED_SUB_LANGS: "${PREFERRED_SUB_LANGS:-}"
+      REQUIRE_SEEKABLE: "${REQUIRE_SEEKABLE:-true}"
+      PREFER_HDR: "${PREFER_HDR:-false}"
+      PREFER_CODEC: "${PREFER_CODEC:-hevc,avc}"
+      MIN_VIDEO_HEIGHT: "${MIN_VIDEO_HEIGHT:-720}"
+      MAX_REDIRECTS: "${MAX_REDIRECTS:-2}"
+      USER_AGENT: "${USER_AGENT:-StremioLinkRanker/1.0}"
+      MKV_META_MAX_BYTES: "${MKV_META_MAX_BYTES:-2097152}"
+      MKV_META_CHUNK_BYTES: "${MKV_META_CHUNK_BYTES:-262144}"
