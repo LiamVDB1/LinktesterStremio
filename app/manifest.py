@@ -13,17 +13,8 @@ def build_manifest(settings: Settings) -> dict:
         "types": ["movie", "series"],
         "idPrefixes": ["tt", "kitsu", "anilist", "tmdb"],
         "catalogs": [],
-        "behaviorHints": {"configurable": True, "configurationRequired": True},
+        "behaviorHints": {"configurable": False},
         "logo": "https://raw.githubusercontent.com/Stremio/stremio-addon-sdk/master/docs/logo.png",
         "background": "https://raw.githubusercontent.com/Stremio/stremio-addon-sdk/master/docs/background.jpg",
         "contactEmail": "noreply@example.invalid",
-        "config": [
-            {
-                "key": "UPSTREAM_BASE_URL",
-                "title": "Upstream base URL",
-                "type": "text",
-                "required": True,
-                "default": str(settings.upstream_base_url),
-            }
-        ],
     }
