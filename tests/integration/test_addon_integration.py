@@ -212,8 +212,8 @@ async def test_labels_show_p2_skipped_and_p3_disabled() -> None:
     async def upstream_stream(type: str, id: str) -> dict[str, Any]:
         return {
             "streams": [
-                {"name": "FAST", "url": "http://upstream/video/fast"},
-                {"name": "SLOW", "url": "http://upstream/video/slow2"},
+                {"name": "FAST 1080p", "url": "http://upstream/video/fast"},
+                {"name": "SLOW 1080p", "url": "http://upstream/video/slow2"},
             ]
         }
 
@@ -255,5 +255,108 @@ async def test_labels_show_p2_skipped_and_p3_disabled() -> None:
     assert "P3-" in (by_url["http://upstream/video/slow2"].get("title") or "")
     assert "P2✓" in (by_url["http://upstream/video/fast"].get("title") or "")
     assert "P2-" in (by_url["http://upstream/video/slow2"].get("title") or "")
+
+    await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_caches_ranked_results() -> None:
+    upstream = FastAPI()
+    blob = build_mini_mkv_bytes()
+    counters = {"streams": 0, "video": 0}
+
+    @upstream.get("/stream/{type}/{id}.json")
+    async def upstream_stream(type: str, id: str) -> dict[str, Any]:
+        counters["streams"] += 1
+        return {"streams": [{"name": "GOOD", "url": "http://upstream/video/good"}]}
+
+    @upstream.get("/video/good")
+    async def video_good(
+        range_header: str | None = Header(default=None, alias="Range"),
+    ) -> Response:
+        counters["video"] += 1
+        return range_response(blob, range_header)
+
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=upstream), base_url="http://upstream"
+    )
+    settings = Settings(
+        UPSTREAM_BASE_URL="http://upstream",
+        TOP_M_PHASE2="0",
+        TOP_P_WEIRD="0",
+        STREAM_CACHE_TTL_S="60",
+        PROBE_CACHE_TTL_S="60",
+        META_CACHE_TTL_S="60",
+    )
+    addon = create_app(settings=settings, client=upstream_client)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=addon), base_url="http://addon"
+    ) as client:
+        first = await client.get("/stream/movie/tt123.json")
+        second = await client.get("/stream/movie/tt123.json")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert counters["streams"] == 1
+    assert counters["video"] == 1
+
+    await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_returns_only_top_three_fhd_and_uhd_results() -> None:
+    upstream = FastAPI()
+    blob = build_mini_mkv_bytes()
+    stream_defs = [
+        ("fhd-a", "🚀 FHD", "🎥 BluRay 🎞️ HEVC | 📦 4.4 GB 📊 5.2 Mbps"),
+        ("fhd-b", "🚀 FHD", "🎥 BluRay 🎞️ HEVC | 📦 4.8 GB 📊 5.8 Mbps"),
+        ("fhd-c", "🚀 FHD", "🎥 BluRay 🎞️ AVC | 📦 7.2 GB 📊 8.6 Mbps"),
+        ("fhd-d", "🚀 FHD", "🎥 BluRay REMUX 🎞️ AVC | 📦 33.2 GB 📊 39.2 Mbps"),
+        ("uhd-a", "✨ 4K", "🎥 BluRay 🎞️ HEVC | 📦 18 GB 📊 19 Mbps"),
+        ("uhd-b", "✨ 4K", "🎥 BluRay 🎞️ HEVC | 📦 21 GB 📊 22 Mbps"),
+        ("uhd-c", "✨ 4K", "🎥 BluRay REMUX 📺 HDR | DV 🎞️ HEVC | 📦 36.6 GB 📊 76.2 Mbps"),
+        ("uhd-d", "✨ 4K", "🎥 WEB-DL 📺 HDR 🎞️ HEVC | 📦 14 GB 📊 15 Mbps"),
+        ("hd-a", "📺 HD", "🎥 WEB-DL 🎞️ AVC | 📦 1.5 GB 📊 3.5 Mbps"),
+    ]
+
+    @upstream.get("/stream/{type}/{id}.json")
+    async def upstream_stream(type: str, id: str) -> dict[str, Any]:
+        return {
+            "streams": [
+                {"name": name, "description": description, "url": f"http://upstream/video/{slug}"}
+                for slug, name, description in stream_defs
+            ]
+        }
+
+    @upstream.get("/video/{slug}")
+    async def video(
+        slug: str, range_header: str | None = Header(default=None, alias="Range")
+    ) -> Response:
+        return range_response(blob, range_header)
+
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=upstream), base_url="http://upstream"
+    )
+    settings = Settings(
+        UPSTREAM_BASE_URL="http://upstream",
+        TOP_K_PHASE1="9",
+        TOP_M_PHASE2="0",
+        TOP_P_WEIRD="0",
+    )
+    addon = create_app(settings=settings, client=upstream_client)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=addon), base_url="http://addon"
+    ) as client:
+        response = await client.get("/stream/movie/tt123.json")
+
+    assert response.status_code == 200
+    streams = response.json()["streams"]
+    assert len(streams) == 6
+    titles = [stream.get("title") or "" for stream in streams]
+    assert sum("FHD #" in title for title in titles) == 3
+    assert sum("4K #" in title for title in titles) == 3
+    assert all(not title.startswith("HD #") for title in titles)
 
     await upstream_client.aclose()

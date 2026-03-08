@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -22,6 +23,14 @@ ID_AUDIO = bytes.fromhex("E1")
 ID_PIXEL_HEIGHT = bytes.fromhex("BA")
 ID_CHANNELS = bytes.fromhex("9F")
 
+# SeekHead related IDs
+ID_SEEK_HEAD = bytes.fromhex("114D9B74")
+ID_SEEK = bytes.fromhex("4DBB")
+ID_SEEK_ID = bytes.fromhex("53AB")
+ID_SEEK_POSITION = bytes.fromhex("53AC")
+ID_DURATION = bytes.fromhex("4489")
+ID_TIMECODE_SCALE = bytes.fromhex("2AD7B1")
+
 
 @dataclass(frozen=True)
 class VideoTrack:
@@ -43,6 +52,7 @@ class AudioTrack:
 class MkvMetadata:
     video_tracks: list[VideoTrack]
     audio_tracks: list[AudioTrack]
+    duration_s: float | None = None
 
 
 class EbmlParseError(RuntimeError):
@@ -83,9 +93,12 @@ def _iter_elements(data: bytes, start: int, end: int) -> Iterable[tuple[int, int
         payload_start = pos3
         payload_end = end if size < 0 else payload_start + size
         if payload_end > end:
+            # Partial buffer: yield a truncated payload and stop (common for Segment).
+            yield element_id, payload_start, end
             return
         yield element_id, payload_start, payload_end
         if size < 0:
+            # Unknown-size element consumes remainder of buffer; cannot safely continue.
             return
         pos = payload_end
 
@@ -103,14 +116,73 @@ def _decode_uint(b: bytes) -> int:
     return int.from_bytes(b, "big", signed=False)
 
 
+def _decode_float(b: bytes) -> float | None:
+    if len(b) == 4:
+        import struct
+
+        return struct.unpack(">f", b)[0]
+    if len(b) == 8:
+        import struct
+
+        return struct.unpack(">d", b)[0]
+    return None
+
+
+def _read_element_at(data: bytes, pos: int, *, end: int) -> tuple[int, int, int]:
+    """
+    Read a single EBML element header at absolute position `pos` in `data`.
+    Returns (element_id_int, payload_start, payload_end).
+    Raises EbmlParseError if truncated.
+    """
+    if pos >= end:
+        raise EbmlParseError("element_at: pos beyond end")
+
+    element_id, pos2 = _read_vint(data, pos, is_id=True)
+    size, pos3 = _read_vint(data, pos2, is_id=False)
+    payload_start = pos3
+    payload_end = end if size < 0 else payload_start + size
+
+    if payload_end > end:
+        raise EbmlParseError("element_at: truncated payload")
+    return element_id, payload_start, payload_end
+
+
+def _seekhead_tracks_offset(seekhead_payload: bytes) -> int | None:
+    """
+    Parse SeekHead payload (not including header) and return SeekPosition for Tracks (relative to Segment data start),
+    or None if not present.
+    """
+    tracks_id_int = int.from_bytes(ID_TRACKS, "big")
+    for element_id, p0, p1 in _iter_elements(seekhead_payload, 0, len(seekhead_payload)):
+        if element_id != int.from_bytes(ID_SEEK, "big"):
+            continue
+        seek_entry = seekhead_payload[p0:p1]
+        seek_id_int: int | None = None
+        seek_pos: int | None = None
+        for sid, q0, q1 in _iter_elements(seek_entry, 0, len(seek_entry)):
+            payload = seek_entry[q0:q1]
+            if sid == int.from_bytes(ID_SEEK_ID, "big"):
+                # payload is the raw element ID bytes (vint-form); interpret as int and compare.
+                seek_id_int = int.from_bytes(payload, "big")
+            elif sid == int.from_bytes(ID_SEEK_POSITION, "big"):
+                seek_pos = _decode_uint(payload)
+        if seek_id_int == tracks_id_int and seek_pos is not None:
+            return seek_pos
+    return None
+
+
 def parse_mkv_metadata(prefix_bytes: bytes) -> MkvMetadata:
+    logger = logging.getLogger("uvicorn.error")
     if not prefix_bytes.startswith(EBML_MAGIC):
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("mkv parse fail missing_magic bytes=%d", len(prefix_bytes))
         raise EbmlParseError("missing EBML magic")
 
     video_tracks: list[VideoTrack] = []
     audio_tracks: list[AudioTrack] = []
+    duration_s: float | None = None
 
-    # Find Segment, then walk its children to find Tracks.
+    # Find Segment.
     segment_payload: tuple[int, int] | None = None
     for element_id, p0, p1 in _iter_elements(prefix_bytes, 0, len(prefix_bytes)):
         if element_id == int.from_bytes(ID_SEGMENT, "big"):
@@ -120,20 +192,96 @@ def parse_mkv_metadata(prefix_bytes: bytes) -> MkvMetadata:
     if not segment_payload:
         raise EbmlParseError("missing Segment")
 
-    seg0, seg1 = segment_payload
-    for element_id, p0, p1 in _iter_elements(prefix_bytes, seg0, seg1):
-        if element_id != int.from_bytes(ID_TRACKS, "big"):
-            continue
-        _parse_tracks(prefix_bytes[p0:p1], video_tracks, audio_tracks)
-        break
+    seg0, seg1 = segment_payload  # seg0 is Segment DATA start (payload start)
+    segment_data_start = seg0
 
-    return MkvMetadata(video_tracks=video_tracks, audio_tracks=audio_tracks)
+    # Pass 1: scan top-level elements inside Segment until buffer ends.
+    # We try:
+    #  - if we hit Tracks normally: parse and return
+    #  - if we see SeekHead: remember tracks offset
+    tracks_seek_offset: int | None = None
+
+    for element_id, p0, p1 in _iter_elements(prefix_bytes, seg0, seg1):
+        if element_id == int.from_bytes(ID_SEEK_HEAD, "big"):
+            # Parse SeekHead payload and remember tracks position if present.
+            seekhead_payload = prefix_bytes[p0:p1]
+            tracks_seek_offset = _seekhead_tracks_offset(seekhead_payload)
+            if logger.isEnabledFor(logging.DEBUG) and tracks_seek_offset is not None:
+                logger.debug(
+                    "mkv seekhead tracks_offset=%d seg_data_start=%d bytes=%d",
+                    tracks_seek_offset,
+                    segment_data_start,
+                    len(prefix_bytes),
+                )
+        elif element_id == int.from_bytes(ID_INFO, "big"):
+            duration_s = _parse_info_duration(prefix_bytes[p0:p1])
+        elif element_id == int.from_bytes(ID_TRACKS, "big"):
+            _parse_tracks(prefix_bytes[p0:p1], video_tracks, audio_tracks)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "mkv tracks sequential a=%d v=%d bytes=%d",
+                    len(audio_tracks),
+                    len(video_tracks),
+                    len(prefix_bytes),
+                )
+            return MkvMetadata(
+                video_tracks=video_tracks,
+                audio_tracks=audio_tracks,
+                duration_s=duration_s,
+            )
+
+    # If we didn't find Tracks by sequential scan, but SeekHead told us where Tracks is,
+    # try to jump directly to that absolute offset.
+    if tracks_seek_offset is not None:
+        abs_pos = segment_data_start + tracks_seek_offset
+        if abs_pos >= len(prefix_bytes):
+            # We know where Tracks should be, but we haven't fetched far enough yet.
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "mkv tracks seek_offset_beyond_bytes abs=%d bytes=%d",
+                    abs_pos,
+                    len(prefix_bytes),
+                )
+            raise EbmlParseError("Tracks offset beyond available bytes")
+
+        # Read element at that offset (absolute in file buffer).
+        try:
+            eid, p0, p1 = _read_element_at(prefix_bytes, abs_pos, end=len(prefix_bytes))
+        except EbmlParseError as e:
+            # Not enough bytes to parse full Tracks element yet.
+            raise EbmlParseError(f"Tracks at seek offset not yet parseable: {e}") from e
+
+        if eid != int.from_bytes(ID_TRACKS, "big"):
+            # SeekHead pointed somewhere unexpected (corrupt or uncommon layout).
+            # Fall back to "not found yet" behavior.
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("mkv tracks seekhead_mismatch eid=%#x abs=%d", eid, abs_pos)
+            raise EbmlParseError("SeekHead Tracks pointer did not land on Tracks")
+
+        _parse_tracks(prefix_bytes[p0:p1], video_tracks, audio_tracks)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "mkv tracks seek_jump a=%d v=%d abs=%d bytes=%d",
+                len(audio_tracks),
+                len(video_tracks),
+                abs_pos,
+                len(prefix_bytes),
+            )
+        return MkvMetadata(
+            video_tracks=video_tracks,
+            audio_tracks=audio_tracks,
+            duration_s=duration_s,
+        )
+
+    # No Tracks found yet in this buffer (and no usable SeekHead pointer).
+    # Return empty metadata (caller can keep fetching more and retry).
+    return MkvMetadata(video_tracks=video_tracks, audio_tracks=audio_tracks, duration_s=duration_s)
 
 
 def _parse_tracks(
     tracks_bytes: bytes, video_tracks: list[VideoTrack], audio_tracks: list[AudioTrack]
 ) -> None:
-    # tracks_bytes includes only payload; parse its children directly.
+    # tracks_bytes includes full Tracks element PAYLOAD (because caller sliced payload already).
     for element_id, p0, p1 in _iter_elements(tracks_bytes, 0, len(tracks_bytes)):
         if element_id != int.from_bytes(ID_TRACK_ENTRY, "big"):
             continue
@@ -198,3 +346,17 @@ def _parse_audio(audio_bytes: bytes) -> int | None:
         if element_id == int.from_bytes(ID_CHANNELS, "big"):
             return _decode_uint(audio_bytes[p0:p1])
     return None
+
+
+def _parse_info_duration(info_bytes: bytes) -> float | None:
+    timecode_scale = 1_000_000
+    duration_raw: float | None = None
+    for element_id, p0, p1 in _iter_elements(info_bytes, 0, len(info_bytes)):
+        payload = info_bytes[p0:p1]
+        if element_id == int.from_bytes(ID_TIMECODE_SCALE, "big"):
+            timecode_scale = _decode_uint(payload) or timecode_scale
+        elif element_id == int.from_bytes(ID_DURATION, "big"):
+            duration_raw = _decode_float(payload)
+    if duration_raw is None:
+        return None
+    return (duration_raw * timecode_scale) / 1_000_000_000

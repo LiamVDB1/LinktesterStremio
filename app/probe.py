@@ -57,6 +57,18 @@ def _parse_total_size(headers: httpx.Headers) -> int | None:
     return None
 
 
+def parse_content_range(content_range: str | None) -> tuple[int, int, int | None] | None:
+    if not content_range:
+        return None
+    m = _RE_CONTENT_RANGE.match(content_range.strip())
+    if not m:
+        return None
+    start = int(m.group(1))
+    end = int(m.group(2))
+    total = m.group(3)
+    return start, end, (int(total) if total.isdigit() else None)
+
+
 def _is_seekable(headers: httpx.Headers) -> bool:
     ar = headers.get("Accept-Ranges", "")
     if "bytes" in ar.lower():
@@ -76,25 +88,12 @@ async def range_probe_1kb(
         result = await _range_probe_1kb_once(url=url, client=client, settings=settings, sem=sem)
         if result.ok or result.hard_fail:
             return result
-        if attempt == 0 and (result.error or "").startswith(("request_error")):
+        if attempt == 0 and (result.error or "").startswith(("request_error", "timeout")):
             continue
-        return ProbeResult(
-            ok=False,
-            hard_fail=True,
-            url=result.url,
-            status_code=result.status_code,
-            seekable=result.seekable,
-            content_type=result.content_type,
-            total_size=result.total_size,
-            ttfb_ms=result.ttfb_ms,
-            dl_1kb_ms=result.dl_1kb_ms,
-            magic_mkv=result.magic_mkv,
-            error=result.error or "retry_exhausted",
-            headers=result.headers,
-        )
+        return result
     return ProbeResult(
         ok=False,
-        hard_fail=True,
+        hard_fail=False,
         url=url,
         status_code=None,
         seekable=False,
@@ -115,7 +114,7 @@ async def _range_probe_1kb_once(
     sem: anyio.Semaphore,
 ) -> ProbeResult:
     async with sem:
-        headers = {"Range": "bytes=0-1024"}
+        headers = {"Range": "bytes=0-1024", "Accept-Encoding": "identity"}
         try:
             with anyio.fail_after(settings.t_probe_total_ms / 1000):
                 start = anyio.current_time()
@@ -258,7 +257,7 @@ async def range_probe_at_offset(
     sem: anyio.Semaphore,
 ) -> tuple[bool, str | None]:
     async with sem:
-        headers = {"Range": f"bytes={offset}-{offset + size - 1}"}
+        headers = {"Range": f"bytes={offset}-{offset + size - 1}", "Accept-Encoding": "identity"}
         try:
             with anyio.fail_after(settings.t_probe_total_ms / 1000):
                 async with client.stream("GET", url, headers=headers) as resp:
@@ -282,17 +281,21 @@ async def fetch_prefix_bytes(
     client: httpx.AsyncClient,
     settings: Settings,
     sem: anyio.Semaphore,
+    total_timeout_ms: int | None = None,
+    ttfb_timeout_ms: int | None = None,
 ) -> bytes | None:
     async with sem:
-        headers = {"Range": f"bytes=0-{size - 1}"}
+        headers = {"Range": f"bytes=0-{size - 1}", "Accept-Encoding": "identity"}
         try:
-            with anyio.fail_after(settings.t_probe_total_ms / 1000):
+            total_s = (total_timeout_ms or settings.t_probe_total_ms) / 1000
+            ttfb_s = (ttfb_timeout_ms or settings.t_ttfb_ms) / 1000
+            with anyio.fail_after(total_s):
                 async with client.stream("GET", url, headers=headers) as resp:
                     if resp.status_code not in (200, 206):
                         return None
                     buf = bytearray()
                     aiter = resp.aiter_bytes()
-                    with anyio.fail_after(settings.t_ttfb_ms / 1000):
+                    with anyio.fail_after(ttfb_s):
                         while len(buf) == 0:
                             try:
                                 chunk = await aiter.__anext__()
@@ -320,19 +323,29 @@ async def fetch_range_bytes(
     client: httpx.AsyncClient,
     settings: Settings,
     sem: anyio.Semaphore,
-) -> tuple[bytes | None, int | None]:
+    total_timeout_ms: int | None = None,
+    ttfb_timeout_ms: int | None = None,
+) -> tuple[bytes | None, int | None, bool]:
     async with sem:
         end = start + length - 1
-        headers = {"Range": f"bytes={start}-{end}"}
+        headers = {"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
         try:
-            with anyio.fail_after(settings.t_probe_total_ms / 1000):
+            total_s = (total_timeout_ms or settings.t_probe_total_ms) / 1000
+            ttfb_s = (ttfb_timeout_ms or settings.t_ttfb_ms) / 1000
+            with anyio.fail_after(total_s):
                 async with client.stream("GET", url, headers=headers) as resp:
                     status = resp.status_code
                     if status not in (200, 206):
-                        return None, status
+                        return None, status, True
+                    if status == 206:
+                        parsed = parse_content_range(resp.headers.get("Content-Range"))
+                        if parsed is not None:
+                            actual_start, _actual_end, _total = parsed
+                            if actual_start != start:
+                                return b"", status, False
                     buf = bytearray()
                     aiter = resp.aiter_bytes()
-                    with anyio.fail_after(settings.t_ttfb_ms / 1000):
+                    with anyio.fail_after(ttfb_s):
                         while len(buf) == 0:
                             try:
                                 chunk = await aiter.__anext__()
@@ -347,6 +360,6 @@ async def fetch_range_bytes(
                         buf.extend(chunk)
                         if len(buf) >= length:
                             break
-                    return bytes(buf[:length]), status
+                    return bytes(buf[:length]), status, True
         except Exception:
-            return None, None
+            return None, None, True

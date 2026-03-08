@@ -90,3 +90,27 @@ async def test_range_probe_hard_fails_when_not_seekable_and_required() -> None:
             )
     assert r.hard_fail
     assert r.error == "not_seekable"
+
+
+@pytest.mark.asyncio
+async def test_range_probe_timeout_is_soft_failure() -> None:
+    settings = Settings(
+        UPSTREAM_BASE_URL="http://upstream.invalid",
+        T_PROBE_TOTAL_MS="50",
+        T_TTFB_MS="50",
+    )
+    sem = anyio.Semaphore(10)
+
+    with respx.mock(assert_all_called=True) as rsps:
+        rsps.get("https://example.test/slow").mock(
+            side_effect=httpx.ReadTimeout(
+                "timed out", request=httpx.Request("GET", "https://example.test/slow")
+            )
+        )
+        async with httpx.AsyncClient() as client:
+            r = await range_probe_1kb(
+                url="https://example.test/slow", client=client, settings=settings, sem=sem
+            )
+    assert not r.ok
+    assert not r.hard_fail
+    assert r.error in {"request_error:ReadTimeout", "timeout"}

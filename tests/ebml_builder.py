@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass
 
 
@@ -49,6 +50,8 @@ ID_AUDIO = bytes.fromhex("E1")
 ID_PIXEL_HEIGHT = bytes.fromhex("BA")
 ID_CHANNELS = bytes.fromhex("9F")
 ID_VOID = bytes.fromhex("EC")
+ID_DURATION = bytes.fromhex("4489")
+ID_TIMECODE_SCALE = bytes.fromhex("2AD7B1")
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,7 @@ class MiniMkvSpec:
     audio_lang_bcp47: str = "nl"
     audio_codec: str = "A_AAC"
     audio_channels: int = 2
+    duration_s: float = 5400.0
 
 
 def build_mini_mkv_bytes(spec: MiniMkvSpec | None = None) -> bytes:
@@ -66,7 +70,15 @@ def build_mini_mkv_bytes(spec: MiniMkvSpec | None = None) -> bytes:
     # EBML header: minimal, payload empty; enough for magic bytes and Element structure.
     ebml_header = _elm(ID_EBML, b"")
 
-    info = _elm(ID_INFO, b"")
+    info = _elm(
+        ID_INFO,
+        b"".join(
+            [
+                _elm(ID_TIMECODE_SCALE, _u(1_000_000)),
+                _elm(ID_DURATION, struct.pack(">d", spec.duration_s * 1000.0)),
+            ]
+        ),
+    )
 
     video = _elm(ID_VIDEO, _elm(ID_PIXEL_HEIGHT, _u(spec.height)))
     video_entry = _elm(
@@ -109,7 +121,15 @@ def build_mkv_with_delayed_tracks(
     spec = spec or MiniMkvSpec()
     ebml_header = _elm(ID_EBML, b"")
 
-    info = _elm(ID_INFO, b"")
+    info = _elm(
+        ID_INFO,
+        b"".join(
+            [
+                _elm(ID_TIMECODE_SCALE, _u(1_000_000)),
+                _elm(ID_DURATION, struct.pack(">d", spec.duration_s * 1000.0)),
+            ]
+        ),
+    )
 
     video = _elm(ID_VIDEO, _elm(ID_PIXEL_HEIGHT, _u(spec.height)))
     video_entry = _elm(
