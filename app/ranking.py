@@ -642,7 +642,7 @@ async def reorder_streams(
     display_indices, display_positions = _select_display_indices(final_scored, all_profiles)
 
     for i in display_indices:
-        s = dict(streams[i])
+        s = _normalize_stream_for_stremio(streams[i])
         label = _format_label_with_phases(
             probe=probes.get(i),
             meta=metas.get(i),
@@ -753,3 +753,28 @@ def _tier_display_name(tier: str) -> str:
     if tier == "uhd":
         return "4K"
     return "FHD"
+
+
+def _normalize_stream_for_stremio(stream: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(stream)
+
+    name = normalized.get("name")
+    title = normalized.get("title")
+    description = normalized.get("description")
+    if not isinstance(name, str) or not name.strip():
+        fallback_name = "Linktester"
+        if isinstance(title, str) and title.strip():
+            fallback_name = title.strip().split(" • ", 1)[0][:80] or fallback_name
+        normalized["name"] = fallback_name
+
+    url = normalized.get("url")
+    if isinstance(url, str) and url.startswith(("http://", "https://")):
+        hints = normalized.get("behaviorHints")
+        merged_hints = dict(hints) if isinstance(hints, dict) else {}
+        merged_hints.setdefault("notWebReady", True)
+        normalized["behaviorHints"] = merged_hints
+
+    if not isinstance(description, str) and isinstance(title, str) and title.strip():
+        normalized["description"] = title
+
+    return normalized

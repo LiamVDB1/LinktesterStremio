@@ -305,6 +305,54 @@ async def test_stream_endpoint_caches_ranked_results() -> None:
 
 
 @pytest.mark.asyncio
+async def test_streams_without_name_are_normalized_for_stremio() -> None:
+    upstream = FastAPI()
+    blob = build_mini_mkv_bytes()
+
+    @upstream.get("/stream/{type}/{id}.json")
+    async def upstream_stream(type: str, id: str) -> dict[str, Any]:
+        return {
+            "streams": [
+                {
+                    "title": "AIO 1080p HEVC 4.2 GB",
+                    "url": "http://upstream/video/good-no-name",
+                }
+            ]
+        }
+
+    @upstream.get("/video/good-no-name")
+    async def video_good(
+        range_header: str | None = Header(default=None, alias="Range"),
+    ) -> Response:
+        return range_response(blob, range_header)
+
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=upstream), base_url="http://upstream"
+    )
+    settings = Settings(
+        UPSTREAM_BASE_URL="http://upstream",
+        TOP_K_PHASE1="1",
+        TOP_M_PHASE2="1",
+        T_PROBE_TOTAL_MS="800",
+        T_TTFB_MS="300",
+        REQUIRE_SEEKABLE="true",
+    )
+    addon = create_app(settings=settings, client=upstream_client)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=addon), base_url="http://addon"
+    ) as client:
+        response = await client.get("/stream/movie/tt123.json")
+
+    assert response.status_code == 200
+    stream = response.json()["streams"][0]
+    assert stream["name"]
+    assert stream["behaviorHints"]["notWebReady"] is True
+
+    await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_stream_endpoint_returns_only_top_three_fhd_and_uhd_results() -> None:
     upstream = FastAPI()
     blob = build_mini_mkv_bytes()
