@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
 from pydantic import AnyHttpUrl, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -27,6 +29,7 @@ class Settings(BaseSettings):
 
     max_redirects: int = Field(default=2, alias="MAX_REDIRECTS", ge=0, le=10)
     user_agent: str = Field(default="StremioLinkRanker/1.0", alias="USER_AGENT")
+    upgrade_http_stream_urls: bool = Field(default=True, alias="UPGRADE_HTTP_STREAM_URLS")
 
     upstream_timeout_ms: int = Field(default=10000, alias="UPSTREAM_TIMEOUT_MS", ge=100, le=120_000)
 
@@ -57,3 +60,8 @@ class Settings(BaseSettings):
     @property
     def prefer_codec_list(self) -> list[str]:
         return [x.strip().lower() for x in self.prefer_codec.split(",") if x.strip()]
+
+    @property
+    def upstream_host(self) -> str | None:
+        parsed = urlsplit(str(self.upstream_base_url))
+        return parsed.hostname.lower() if parsed.hostname else None

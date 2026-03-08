@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from time import monotonic
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import anyio
 import httpx
@@ -642,7 +643,7 @@ async def reorder_streams(
     display_indices, display_positions = _select_display_indices(final_scored, all_profiles)
 
     for i in display_indices:
-        s = _normalize_stream_for_stremio(streams[i])
+        s = _normalize_stream_for_stremio(streams[i], settings=settings)
         label = _format_label_with_phases(
             probe=probes.get(i),
             meta=metas.get(i),
@@ -755,7 +756,7 @@ def _tier_display_name(tier: str) -> str:
     return "FHD"
 
 
-def _normalize_stream_for_stremio(stream: dict[str, Any]) -> dict[str, Any]:
+def _normalize_stream_for_stremio(stream: dict[str, Any], *, settings: Settings) -> dict[str, Any]:
     normalized = dict(stream)
 
     name = normalized.get("name")
@@ -769,6 +770,9 @@ def _normalize_stream_for_stremio(stream: dict[str, Any]) -> dict[str, Any]:
 
     url = normalized.get("url")
     if isinstance(url, str) and url.startswith(("http://", "https://")):
+        if settings.upgrade_http_stream_urls:
+            url = _upgrade_stream_url_to_https(url)
+            normalized["url"] = url
         hints = normalized.get("behaviorHints")
         merged_hints = dict(hints) if isinstance(hints, dict) else {}
         merged_hints.setdefault("notWebReady", True)
@@ -778,3 +782,10 @@ def _normalize_stream_for_stremio(stream: dict[str, Any]) -> dict[str, Any]:
         normalized["description"] = title
 
     return normalized
+
+
+def _upgrade_stream_url_to_https(url: str) -> str:
+    parsed = urlsplit(url)
+    if parsed.scheme != "http":
+        return url
+    return urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, parsed.fragment))
