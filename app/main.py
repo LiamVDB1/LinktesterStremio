@@ -156,6 +156,16 @@ def create_app(
             stats.p3_attempted,
             stats.p3_fail,
         )
+        if not ranked:
+            logger.warning(
+                "stream pipeline produced no streams upstream=%.1fms total=%.1fms streams_in=%d candidates=%d probed=%d kept=%d",
+                upstream_ms,
+                total_ms,
+                stats.streams_in,
+                stats.candidate_urls,
+                stats.probed,
+                stats.kept,
+            )
         return StreamsResponse(streams=ranked)
 
     return app

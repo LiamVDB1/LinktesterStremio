@@ -269,8 +269,10 @@ class RankStats:
     p2_ms: float
     p3_ms: float
     streams_in: int
+    candidate_urls: int
     probed: int
     kept: int
+    displayed: int
     p2_attempted: int
     p2_ok: int
     p3_attempted: int
@@ -664,8 +666,10 @@ async def reorder_streams(
         p2_ms=p2_ms,
         p3_ms=p3_ms,
         streams_in=len(streams),
+        candidate_urls=len(candidate_indices),
         probed=len(url_indices),
         kept=len(kept_top),
+        displayed=len(ranked_streams),
         p2_attempted=p2_attempted,
         p2_ok=p2_ok,
         p3_attempted=p3_attempted,
